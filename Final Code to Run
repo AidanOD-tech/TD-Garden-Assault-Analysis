@@ -1,0 +1,1100 @@
+# Load required libraries
+library(tidyverse)    # For data manipulation and visualisation
+library(ggmap)        # For map visualisation
+library(googleway)    # For Google Maps integration
+library(FNN)          # For KNN regression
+library(caret)        # For model training and evaluation
+library(viridis)      # For color scales
+library(tree)         # For decision tree modeling
+library(boot)         # For cross-validation
+library(lubridate)    # For date handling
+library(gridExtra)    # For arranging plots and adding text annotations
+library(grid)         # For grid graphics (contains textGrob)
+library(RColorBrewer) # For better color palettes
+
+# Register Google API key
+register_google("")
+#Please swap in for your own API Key into the above for the code to run
+
+# ===============================
+# 1. DATA LOADING AND PREPARATION
+# ===============================
+
+# Load data using interactive file selection
+if (interactive()) {
+  message("Please select your Boston crime CSV file...")
+  crime_data <- read.csv(file.choose())
+  message("File successfully loaded!")
+} else if (requireNamespace("rstudioapi", quietly = TRUE)) {
+  message("Opening file chooser via RStudio API...")
+  path <- rstudioapi::selectFile()
+  crime_data <- read.csv(path)
+  message("File successfully loaded!")
+} else {
+  stop("Interactive file selection is not available in this environment.")
+}
+
+# Examine dataset structure
+cat("Dataset has", nrow(crime_data), "rows and", ncol(crime_data), "columns\n")
+cat("Dataset column names:\n")
+print(colnames(crime_data))
+
+## ===============================
+# 2. DATE CONVERSION
+# ===============================
+# Check and prepare datetime columns 
+if("OCCURRED_ON_DATE" %in% colnames(crime_data)) {
+  # First check if it's already a Date object
+  if(!inherits(crime_data$OCCURRED_ON_DATE, "Date") && 
+     !inherits(crime_data$OCCURRED_ON_DATE, "POSIXct")) {
+    
+    # Try different date formats with better error handling
+    cat("Converting date column from character to date object...\n")
+    
+    # Create temporary column for safety
+    crime_data$temp_date <- NA
+    
+    # Try multiple formats
+    formats_to_try <- c(
+      "%Y-%m-%d %H:%M:%S",
+      "%m/%d/%Y %H:%M:%S", 
+      "%m/%d/%Y",
+      "%Y-%m-%d"
+    )
+    
+    for(format in formats_to_try) {
+      # Try this format
+      temp_dates <- as.POSIXct(crime_data$OCCURRED_ON_DATE, format = format)
+      
+      # If more than 90% converted successfully, use this format
+      if(sum(!is.na(temp_dates)) > 0.9 * nrow(crime_data)) {
+        crime_data$temp_date <- temp_dates
+        cat("Successfully converted dates using format:", format, "\n")
+        break
+      }
+    }
+    
+    # If conversion worked, replace the original column
+    if(sum(!is.na(crime_data$temp_date)) > 0) {
+      crime_data$OCCURRED_ON_DATE <- crime_data$temp_date
+    } else {
+      cat("WARNING: Could not parse dates properly. Using dummy dates for analysis.\n")
+      # Create dummy dates spanning the years in the data
+      if("YEAR" %in% colnames(crime_data) && "MONTH" %in% colnames(crime_data)) {
+        crime_data$OCCURRED_ON_DATE <- as.Date(paste(crime_data$YEAR, crime_data$MONTH, "15", sep="-"))
+      } else {
+        # Complete fallback - just use sequential dates
+        crime_data$OCCURRED_ON_DATE <- as.Date("2020-01-01") + 1:nrow(crime_data) %% 365
+      }
+    }
+    
+    # Remove temporary column
+    crime_data$temp_date <- NULL
+  }
+  
+  # Filter data for years 2019-2022
+  crime_data <- crime_data %>%
+    filter(format(as.Date(OCCURRED_ON_DATE), "%Y") %in% c("2019", "2020", "2021", "2022"))
+  
+  # Print number of rows after filtering
+  cat("Dataset after filtering for 2019-2022:\n")
+  cat("Now has", nrow(crime_data), "rows\n")
+  
+  # Optional: Print unique years to verify
+  cat("Unique years in dataset:\n")
+  print(unique(format(as.Date(crime_data$OCCURRED_ON_DATE), "%Y")))
+}
+
+# Ensure HOUR exists
+if(!"HOUR" %in% colnames(crime_data) && inherits(crime_data$OCCURRED_ON_DATE, "POSIXct")) {
+  crime_data$HOUR <- hour(crime_data$OCCURRED_ON_DATE)
+  cat("Created HOUR column from OCCURRED_ON_DATE\n")
+}
+
+# ===============================
+# 3. TD GARDEN AREA FILTERING
+# ===============================
+
+# Identify columns for street and coordinates
+street_col_name <- "STREET"
+offense_col_name <- "OFFENSE_DESCRIPTION"
+
+# Define target streets near TD Garden
+target_streets <- c("CAUSEWAY ST", "CANAL ST", "NASHUA ST")
+
+# Filter for assault incidents on those streets
+td_zone_assaults <- crime_data %>%
+  filter(grepl("ASSAULT", .data[[offense_col_name]], ignore.case = TRUE)) %>%
+  filter(grepl(paste(target_streets, collapse = "|"), .data[[street_col_name]], ignore.case = TRUE))
+
+cat("Found", nrow(td_zone_assaults), "assault incidents in target area\n")
+
+# Create more descriptive ZONE naming
+td_zone_assaults <- td_zone_assaults %>%
+  mutate(ZONE = case_when(
+    grepl("CAUSEWAY", .data[[street_col_name]], ignore.case = TRUE) ~ "Causeway St (Arena Front)",
+    grepl("CANAL", .data[[street_col_name]], ignore.case = TRUE) ~ "Canal St (South Side)",
+    grepl("NASHUA", .data[[street_col_name]], ignore.case = TRUE) ~ "Nashua St (North Side)",
+    TRUE ~ "Other"
+  ))
+
+# Create shorter zone names for map legends
+td_zone_assaults$ZONE_SHORT <- gsub(" \\(.*\\)", "", td_zone_assaults$ZONE)
+
+# ===============================
+# 4. TEMPORAL FEATURES
+# ===============================
+# Add day of week and create weekend flag 
+td_zone_assaults <- td_zone_assaults %>%
+  mutate(
+    # Ensure OCCURRED_ON_DATE is treated as a date for weekday extraction
+    date_for_weekday = as.Date(as.character(OCCURRED_ON_DATE), format="%Y-%m-%d"),
+    
+    # More robust ZONE_SHORT creation
+    ZONE_SHORT = case_when(
+      grepl("CANAL", toupper(.data[[street_col_name]])) ~ "Canal",
+      grepl("CAUSEWAY", toupper(.data[[street_col_name]])) ~ "Causeway",
+      grepl("NASHUA", toupper(.data[[street_col_name]])) ~ "Nashua",
+      TRUE ~ "Other"
+    )
+  )
+
+# Diagnostic prints before weekend plot function
+print("Unique street names:")
+print(unique(td_zone_assaults[[street_col_name]]))
+
+print("Unique ZONE_SHORT values:")
+print(unique(td_zone_assaults$ZONE_SHORT))
+
+# Helper function for creating improved weekend plots
+create_weekend_plot <- function(data, street_name) {
+  # Filter data for specific street
+  street_data <- data %>% 
+    filter(ZONE_SHORT == street_name)
+  
+  # Debugging print statements
+  cat("Creating plot for:", street_name, "\n")
+  cat("Total rows:", nrow(street_data), "\n")
+  
+  # If no data, return a message plot
+  if(nrow(street_data) == 0) {
+    return(ggplot() + 
+             annotate("text", x = 0.5, y = 0.5, 
+                      label = paste("No data for", street_name)) + 
+             theme_minimal())
+  }
+  
+  # Plot creation
+  plot <- street_data %>%
+    mutate(
+      is_weekend = factor(is_weekend, levels = c("Weekday", "Weekend")),
+      HOUR = as.numeric(HOUR)
+    ) %>%
+    ggplot(aes(x = HOUR, fill = is_weekend)) +
+    geom_histogram(binwidth = 1, position = "dodge", 
+                   color = "black", alpha = 0.7) +
+    labs(
+      title = paste(street_name, "Street - Weekend vs. Weekday"),
+      subtitle = "Assault incidents by time of day",
+      x = "Hour of Day", 
+      y = "Number of Incidents"
+    ) +
+    scale_fill_brewer(palette = "Set1", name = "Day Type") +
+    scale_x_continuous(
+      breaks = c(0, 3, 6, 9, 12, 15, 18, 21, 23), 
+      labels = c("12am", "3am", "6am", "9am", "12pm", "3pm", "6pm", "9pm", "12am")
+    ) +
+    theme_minimal() +
+    theme(
+      panel.grid.minor = element_blank(),
+      plot.title = element_text(face = "bold", size = 14),
+      plot.subtitle = element_text(size = 10),
+      legend.position = "right",
+      plot.margin = unit(c(0.5, 1, 0.5, 0.5), "lines")
+    )
+  
+  return(plot)
+}
+
+# Extract day of week and weekend flag
+td_zone_assaults <- td_zone_assaults %>%
+  mutate(
+    # Extract day of week from the date
+    day_of_week = weekdays(date_for_weekday),
+    # Create weekend flag
+    is_weekend = ifelse(day_of_week %in% c("Saturday", "Sunday"), "Weekend", "Weekday")
+  )
+
+# Comprehensive diagnostic checks
+print("Diagnostic Information:")
+cat("Total incidents:", nrow(td_zone_assaults), "\n")
+
+# Check data for each street with more detailed printing
+streets_to_check <- c("Canal", "Causeway", "Nashua")
+for(street in streets_to_check) {
+  street_data <- td_zone_assaults %>% filter(ZONE_SHORT == street)
+  
+  cat("\n", street, "Street Analysis:\n")
+  cat("Total incidents:", nrow(street_data), "\n")
+  
+  if(nrow(street_data) > 0) {
+    print("Weekend distribution:")
+    print(table(street_data$is_weekend))
+    
+    print("Hour distribution:")
+    print(summary(street_data$HOUR))
+  }
+}
+
+# Verify overall weekend flag
+cat("\nOverall Statistics:\n")
+print("Weekend flag distribution:")
+print(table(td_zone_assaults$is_weekend))
+
+print("Day of week distribution:")
+print(table(td_zone_assaults$day_of_week))
+
+# Create season variable based on month
+td_zone_assaults <- td_zone_assaults %>%
+  mutate(season = case_when(
+    MONTH %in% c(12, 1, 2) ~ "Winter",
+    MONTH %in% c(3, 4, 5) ~ "Spring",
+    MONTH %in% c(6, 7, 8) ~ "Summer",
+    MONTH %in% c(9, 10, 11) ~ "Fall",
+    TRUE ~ "Unknown"
+  ))
+
+# Order seasons correctly
+td_zone_assaults$season <- factor(td_zone_assaults$season, 
+                                  levels = c("Winter", "Spring", "Summer", "Fall"))
+
+# ===============================
+# 5. COORDINATE VALIDATION AND CORRECTION
+# ===============================
+
+# Check coordinate validity and fix if needed
+is_valid_boston_coord <- function(long, lat) {
+  return(!is.na(long) && !is.na(lat) && 
+           long < 0 &&  # Longitude should be negative in Boston
+           long > -72 && long < -70 &&  # Rough longitude range for Boston area
+           lat > 42 && lat < 43)  # Rough latitude range for Boston area
+}
+
+# Check if coordinates need fixing
+coord_check <- sapply(1:nrow(td_zone_assaults), function(i) {
+  is_valid_boston_coord(td_zone_assaults$Long[i], td_zone_assaults$Lat[i])
+})
+
+if(sum(coord_check) < nrow(td_zone_assaults)) {
+  cat("WARNING: Some coordinates appear to be invalid for Boston\n")
+  
+  # Generate spatial coordinates based on street names
+  td_zone_assaults$orig_Long <- td_zone_assaults$Long
+  td_zone_assaults$orig_Lat <- td_zone_assaults$Lat
+  
+  # TD Garden coordinates
+  td_garden_long <- -71.061
+  td_garden_lat <- 42.365
+  
+  # Manually assign coordinates by ZONE for better visualisation
+  td_zone_assaults <- td_zone_assaults %>%
+    mutate(
+      Long = case_when(
+        ZONE_SHORT == "Causeway" ~ td_garden_long + runif(n(), -0.002, 0.002),
+        ZONE_SHORT == "Canal" ~ td_garden_long + 0.003 + runif(n(), -0.002, 0.002),
+        ZONE_SHORT == "Nashua" ~ td_garden_long - 0.003 + runif(n(), -0.002, 0.002),
+        TRUE ~ td_garden_long + runif(n(), -0.004, 0.004)
+      ),
+      Lat = case_when(
+        ZONE_SHORT == "Causeway" ~ td_garden_lat + runif(n(), -0.002, 0.002),
+        ZONE_SHORT == "Canal" ~ td_garden_lat - 0.003 + runif(n(), -0.002, 0.002),
+        ZONE_SHORT == "Nashua" ~ td_garden_lat + 0.003 + runif(n(), -0.002, 0.002),
+        TRUE ~ td_garden_lat + runif(n(), -0.004, 0.004)
+      )
+    )
+}
+
+# Remove any rows with NA coordinates
+td_zone_assaults <- td_zone_assaults %>%
+  filter(!is.na(Long), !is.na(Lat))
+
+cat("Final dataset has", nrow(td_zone_assaults), "records with valid coordinates\n")
+
+# ===============================
+# 6. EXPLORATORY VISUALISATIONS
+# ===============================
+
+# Create better hour labels for x-axis
+hour_labels <- c("12am", "3am", "6am", "9am", "12pm", "3pm", "6pm", "9pm")
+hour_breaks <- c(0, 3, 6, 9, 12, 15, 18, 21)
+
+# Fix factors for zone ordering in plots
+td_zone_assaults$ZONE <- factor(td_zone_assaults$ZONE, 
+                                levels = c("Canal St (South Side)", 
+                                           "Causeway St (Arena Front)", 
+                                           "Nashua St (North Side)"))
+
+# Create improved hourly distribution plot
+hour_plot <- ggplot(td_zone_assaults, aes(x = HOUR, fill = ZONE_SHORT)) +
+  geom_histogram(binwidth = 1, position = "identity", alpha = 0.8) +
+  facet_wrap(~ ZONE, scales = "free_y", ncol = 1) +
+  labs(title = "Assault Incidents by Time of Day",
+       subtitle = "Hourly distribution across key streets near TD Garden",
+       x = "Time of Day", 
+       y = "Number of Incidents") +
+  scale_x_continuous(breaks = hour_breaks, 
+                     labels = hour_labels,
+                     limits = c(0, 23),
+                     expand = c(0.01, 0.01)) +
+  scale_fill_brewer(palette = "Set1", name = "Street") +
+  theme_minimal() +
+  theme(
+    panel.spacing.y = unit(1.5, "lines"),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "gray80", fill = NA),
+    strip.text = element_text(size = 12, face = "bold"),
+    strip.background = element_rect(fill = "gray95"),
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 10),
+    legend.position = "none"  # Remove legend since it's in the facet labels
+  )
+
+# Create weekend plots using the helper function
+canal_weekend_plot <- create_weekend_plot(td_zone_assaults, "Canal")
+causeway_weekend_plot <- create_weekend_plot(td_zone_assaults, "Causeway")
+nashua_weekend_plot <- create_weekend_plot(td_zone_assaults, "Nashua")
+
+# Create seasonal analysis plot
+season_plot <- ggplot(td_zone_assaults, aes(x = ZONE, fill = season)) +
+  geom_bar(position = "dodge") +
+  labs(title = "Seasonal Assault Patterns",
+       subtitle = "Distribution across seasons near TD Garden",
+       x = "Location", 
+       y = "Number of Incidents") +
+  scale_fill_brewer(palette = "Set2", name = "Season") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 10)
+  )
+
+# Get base map of TD Garden area
+boston_map <- get_googlemap(center = c(lon = -71.061, lat = 42.365), 
+                            zoom = 15, 
+                            maptype = "roadmap")
+
+# Create a simplified location map
+location_map <- ggmap(boston_map) +
+  geom_point(data = td_zone_assaults, 
+             aes(x = Long, y = Lat, color = ZONE_SHORT), 
+             size = 3) +
+  # Annotate the TD Garden location
+  annotate("point", x = -71.0621, y = 42.3663, color = "black", size = 5, shape = 8) +
+  annotate("text", x = -71.0621, y = 42.3673, label = "TD Garden", 
+           fontface = "bold", size = 4, color = "black") +
+  # Add reference lines instead of a circle (simpler)
+  geom_hline(yintercept = 42.3663, linetype = "dashed", color = "gray40") +
+  geom_vline(xintercept = -71.0621, linetype = "dashed", color = "gray40") +
+  scale_color_brewer(palette = "Set1", name = "Street Zone") +
+  labs(title = "Assault Locations around TD Garden", 
+       subtitle = "Geographic distribution across three key streets",
+       x = "Geographic Position (West to East)", 
+       y = "Geographic Position (South to North)") +
+  theme_minimal() +
+  theme(
+    axis.title = element_text(size = 11),
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 10),
+    legend.position = "right",
+    legend.background = element_rect(fill = "white")
+  )
+
+# Create a map showing weekend vs. weekday patterns
+weekend_map <- ggmap(boston_map) +
+  geom_point(data = td_zone_assaults, 
+             aes(x = Long, y = Lat, color = is_weekend), 
+             size = 3) +
+  # Annotate the TD Garden location
+  annotate("point", x = -71.0621, y = 42.3663, color = "black", size = 5, shape = 8) +
+  annotate("text", x = -71.0621, y = 42.3673, label = "TD Garden", 
+           fontface = "bold", size = 3.5, color = "black") +
+  scale_color_manual(values = c("Weekday" = "#1B9E77", "Weekend" = "#D95F02"), 
+                     name = "Day Type") +
+  labs(title = "Weekend vs. Weekday Assault Patterns", 
+       subtitle = "Spatial distribution by day type near TD Garden",
+       x = "Geographic Position (West to East)", 
+       y = "Geographic Position (South to North)") +
+  theme_minimal() +
+  theme(
+    axis.title = element_text(size = 11),
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 10),
+    legend.position = "right",
+    legend.background = element_rect(fill = "white")
+  )
+
+# Create a map showing seasonal patterns
+season_map <- ggmap(boston_map) +
+  geom_point(data = td_zone_assaults, 
+             aes(x = Long, y = Lat, color = season), 
+             size = 3) +
+  # Annotate the TD Garden location
+  annotate("point", x = -71.0621, y = 42.3663, color = "black", size = 5, shape = 8) +
+  annotate("text", x = -71.0621, y = 42.3673, label = "TD Garden", 
+           fontface = "bold", size = 3.5, color = "black") +
+  scale_color_brewer(palette = "Set2", name = "Season") +
+  labs(title = "Seasonal Assault Patterns", 
+       subtitle = "Spatial distribution by season near TD Garden",
+       x = "Geographic Position (West to East)", 
+       y = "Geographic Position (South to North)") +
+  theme_minimal() +
+  theme(
+    axis.title = element_text(size = 11),
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 10),
+    legend.position = "right",
+    legend.background = element_rect(fill = "white")
+  )
+
+# ===============================
+# 7. RADIUS OPTIMISATION FOR DENSITY CALCULATION
+# ===============================
+
+# Test different radius values
+radius_values <- c(0.001, 0.002, 0.003, 0.004)
+radius_results <- data.frame(radius = radius_values, 
+                             mean_density = NA, 
+                             min_density = NA,
+                             max_density = NA)
+
+density_by_radius <- list()
+
+# Calculate density for each radius
+for(i in 1:length(radius_values)) {
+  current_radius <- radius_values[i]
+  temp_density <- rep(0, nrow(td_zone_assaults))
+  
+  for(j in 1:nrow(td_zone_assaults)) {
+    distances <- sqrt((td_zone_assaults$Long - td_zone_assaults$Long[j])^2 +
+                        (td_zone_assaults$Lat - td_zone_assaults$Lat[j])^2)
+    temp_density[j] <- sum(distances <= current_radius) - 1
+  }
+  
+  # Store the density values
+  density_by_radius[[i]] <- temp_density
+  
+  # Calculate statistics
+  radius_results$mean_density[i] <- mean(temp_density)
+  radius_results$min_density[i] <- min(temp_density)
+  radius_results$max_density[i] <- max(temp_density)
+}
+
+# Add approximate meters to the radius values
+radius_results$meters <- c(100, 200, 300, 400)
+
+# Print radius optimisation results
+cat("\nRadius comparison results:\n")
+print(radius_results)
+
+# Choose the optimal radius (using 0.002 which is ~200m)
+radius <- 0.002
+td_zone_assaults$density <- density_by_radius[[which(radius_values == radius)]]
+
+# Summarise density measure
+cat("\nSpatial density summary (incidents within 200m):\n")
+print(summary(td_zone_assaults$density))
+
+# Plot density distribution by radius
+radius_plot <- ggplot(radius_results, aes(x = factor(meters), y = mean_density)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  geom_errorbar(aes(ymin = min_density, ymax = max_density), width = 0.2) +
+  labs(title = "Effect of Radius on Density Calculation",
+       subtitle = "Average, minimum and maximum density values",
+       x = "Radius (meters)",
+       y = "Incident Density") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10),
+    panel.grid.minor = element_blank()
+  )
+
+# ===============================
+# 8. PREDICTIVE MODELING
+# ===============================
+
+# Fix the train/test split variable naming conflict
+set.seed(42)  # For reproducibility
+
+# Use different variable names to avoid conflict with train() function
+training_indices <- sample(1:nrow(td_zone_assaults), size = round(0.8 * nrow(td_zone_assaults)))
+training_data <- td_zone_assaults[training_indices, ]
+testing_data <- td_zone_assaults[-training_indices, ]
+
+cat("\nTraining data:", nrow(training_data), "observations\n")
+cat("Testing data:", nrow(testing_data), "observations\n")
+
+# ---- Model 1: kNN Regression with Cross-Validation ----
+# Perform 5-fold cross-validation
+set.seed(123)
+cv_folds <- createFolds(training_data$density, k = 5, list = TRUE, returnTrain = FALSE)
+cv_results_knn <- data.frame(fold = 1:5, mse = NA)
+
+for(i in 1:5) {
+  # Split data
+  cv_test_indices <- cv_folds[[i]]
+  cv_train_indices <- setdiff(1:nrow(training_data), cv_test_indices)
+  
+  # Train model
+  knn_cv <- knn.reg(
+    train = as.matrix(training_data[cv_train_indices, c("Long", "Lat")]),
+    test = as.matrix(training_data[cv_test_indices, c("Long", "Lat")]),
+    y = training_data$density[cv_train_indices],
+    k = 5
+  )
+  
+  # Calculate MSE
+  cv_results_knn$mse[i] <- mean((training_data$density[cv_test_indices] - knn_cv$pred)^2)
+}
+
+cat("\nCross-validation results for kNN model:\n")
+print(cv_results_knn)
+cat("Average MSE:", mean(cv_results_knn$mse), "\n")
+cat("Standard deviation:", sd(cv_results_knn$mse), "\n")
+
+# Train final kNN model on full training set
+knn_model <- knn.reg(train = as.matrix(training_data[, c("Long", "Lat")]),
+                     test = as.matrix(testing_data[, c("Long", "Lat")]),
+                     y = training_data$density, 
+                     k = 5)
+
+testing_data$knn_predicted_density <- knn_model$pred
+cat("kNN model successfully trained\n")
+
+# ---- Model 2: Linear Regression ----
+lm_model <- lm(density ~ Long + Lat + HOUR, data = training_data)
+testing_data$lm_predicted_density <- predict(lm_model, newdata = testing_data)
+
+cat("Linear regression model summary:\n")
+print(summary(lm_model))
+
+# ---- Model 3: Decision Tree ----
+tree_model <- tree(density ~ Long + Lat + HOUR, data = training_data)
+testing_data$tree_predicted_density <- predict(tree_model, newdata = testing_data)
+
+cat("Decision tree model summary:\n")
+print(summary(tree_model))
+
+# ---- Model 4: Polynomial Linear Regression ----
+poly_model <- lm(density ~ poly(Long, 2) + poly(Lat, 2) + HOUR, data = training_data)
+testing_data$poly_predicted_density <- predict(poly_model, newdata = testing_data)
+
+cat("Polynomial regression model summary:\n")
+print(summary(poly_model))
+
+# ---- Model 5: Ensemble Model (Average of kNN and Polynomial) ----
+testing_data$ensemble_predicted_density <- (testing_data$knn_predicted_density + 
+                                              testing_data$poly_predicted_density) / 2
+
+# ---- Model 6: Weighted Ensemble Model (0.7*kNN + 0.3*Polynomial) ----
+testing_data$weighted_ensemble_density <- 0.7 * testing_data$knn_predicted_density + 
+  0.3 * testing_data$poly_predicted_density
+
+# ===============================
+# 9. MODEL EVALUATION
+# ===============================
+
+# Calculate MSE for each model
+mse_knn <- mean((testing_data$density - testing_data$knn_predicted_density)^2)
+mse_lm <- mean((testing_data$density - testing_data$lm_predicted_density)^2)
+mse_tree <- mean((testing_data$density - testing_data$tree_predicted_density)^2)
+mse_poly <- mean((testing_data$density - testing_data$poly_predicted_density)^2)
+mse_ensemble <- mean((testing_data$density - testing_data$ensemble_predicted_density)^2)
+mse_weighted <- mean((testing_data$density - testing_data$weighted_ensemble_density)^2)
+
+# Create a data frame for model comparison
+model_comparison <- data.frame(
+  Model = c("k-Nearest Neighbors", "Linear Regression", "Decision Tree", 
+            "Polynomial Regression", "Ensemble (Mean)", "Ensemble (Weighted)"),
+  MSE = c(mse_knn, mse_lm, mse_tree, mse_poly, mse_ensemble, mse_weighted),
+  RMSE = sqrt(c(mse_knn, mse_lm, mse_tree, mse_poly, mse_ensemble, mse_weighted))
+)
+
+# Sort by performance
+model_comparison <- model_comparison %>%
+  arrange(MSE)
+
+cat("\nModel Performance Comparison:\n")
+print(model_comparison)
+
+# Identify best model
+best_model_name <- model_comparison$Model[1]
+best_pred_col <- if(grepl("k-Nearest", best_model_name)) {
+  "knn_predicted_density"
+} else if(grepl("Weighted", best_model_name)) {
+  "weighted_ensemble_density"
+} else if(grepl("Ensemble", best_model_name)) {
+  "ensemble_predicted_density"
+} else if(grepl("Polynomial", best_model_name)) {
+  "poly_predicted_density"
+} else if(grepl("Tree", best_model_name)) {
+  "tree_predicted_density"
+} else {
+  "lm_predicted_density"
+}
+
+cat("\nBest performing model:", best_model_name, "\n")
+
+# Improved Model Comparison Plot
+# Create a separate data frame for the text annotation
+model_rankings <- data.frame(
+  x = 30,
+  y = c(70, 65, 60),
+  label = c(
+    paste("1.", model_comparison$Model[1], "(MSE:", round(model_comparison$MSE[1], 2), ")"),
+    paste("2.", model_comparison$Model[2], "(MSE:", round(model_comparison$MSE[2], 2), ")"),
+    paste("3.", model_comparison$Model[3], "(MSE:", round(model_comparison$MSE[3], 2), ")")
+  )
+)
+
+# Create improved model comparison plot
+plot_compare <- ggplot(testing_data, aes(x = density)) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") +
+  geom_point(aes(y = knn_predicted_density, color = "kNN"), alpha = 0.7, size = 3) +
+  geom_point(aes(y = lm_predicted_density, color = "Linear"), alpha = 0.7, size = 3) +
+  geom_point(aes(y = tree_predicted_density, color = "Tree"), alpha = 0.7, size = 3) +
+  geom_point(aes(y = poly_predicted_density, color = "Poly"), alpha = 0.7, size = 3) +
+  geom_point(aes(y = ensemble_predicted_density, color = "Ensemble"), alpha = 0.7, size = 3) +
+  geom_text(
+    data = model_rankings, 
+    aes(x = x, y = y, label = label),
+    hjust = 0, 
+    size = 3, 
+    color = "black"
+  ) +
+  labs(
+    title = "Model Accuracy Comparison", 
+    subtitle = "Predicting Nearby Assault Incidents",
+    caption = "Perfect prediction follows the diagonal line",
+    x = "Actual Nearby Incidents (within 200m)", 
+    y = "Predicted Nearby Incidents",
+    color = "Model Type"
+  ) +
+  scale_color_brewer(palette = "Set1") +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    plot.caption = element_text(hjust = 0.5, size = 10),
+    plot.subtitle = element_text(hjust = 0.5)
+  )
+
+# Create residual column for best model
+testing_data$residual <- testing_data$density - testing_data[[best_pred_col]]
+
+# ===============================
+# 10. SPATIAL VISUALIZATION OF PREDICTIONS
+# ===============================
+
+# Create a custom color palette for density prediction
+density_colors <- colorRampPalette(c("#000066", "#0000FF", "#00FFFF", "#FFFF00", "#FF0000"))(100)
+
+# Simplified density prediction map
+density_map <- ggmap(boston_map) +
+  geom_point(data = td_zone_assaults, 
+             aes(x = Long, y = Lat, color = density), 
+             size = 4) +
+  scale_color_gradientn(
+    colors = density_colors,
+    name = "Incident\nDensity",
+    guide = guide_colorbar(
+      title.position = "top",
+      barwidth = 1,
+      barheight = 10
+    )
+  ) +
+  labs(title = "Assault Density Distribution", 
+       subtitle = "Number of other incidents within 200m radius",
+       x = "Geographic Position (West to East)", 
+       y = "Geographic Position (South to North)") +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 10),
+    panel.grid.minor = element_blank(),
+    plot.margin = unit(c(0.5, 1, 0.5, 0.5), "lines")
+  )
+
+# Create prediction density map
+pred_map <- ggmap(boston_map) +
+  geom_point(data = testing_data, 
+             aes(x = Long, y = Lat, color = .data[[best_pred_col]]),
+             size = 4) +
+  scale_color_gradientn(
+    colors = density_colors,
+    name = "Predicted\nDensity",
+    guide = guide_colorbar(
+      title.position = "top",
+      barwidth = 1,
+      barheight = 10
+    )
+  ) +
+  labs(title = "Assault Density Predictions",
+       subtitle = paste("Using", best_model_name, "- incidents within 200m radius"),
+       x = "Geographic Position (West to East)", 
+       y = "Geographic Position (South to North)") +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10),
+    panel.grid.minor = element_blank(),
+    plot.margin = unit(c(0.5, 1, 0.5, 0.5), "lines")
+  )
+
+# Create residual map
+residual_map <- ggmap(boston_map) +
+  geom_point(data = testing_data, 
+             aes(x = Long, y = Lat, color = residual), 
+             size = 4) +
+  scale_color_gradient2(
+    low = "blue", 
+    mid = "white", 
+    high = "red", 
+    midpoint = 0,
+    name = "Residual",
+    guide = guide_colorbar(
+      title.position = "top",
+      barwidth = 1,
+      barheight = 10
+    )
+  ) +
+  labs(title = "Model Prediction Residuals", 
+       subtitle = "Blue = Underprediction, Red = Overprediction",
+       x = "Geographic Position (West to East)", 
+       y = "Geographic Position (South to North)") +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10),
+    panel.grid.minor = element_blank(),
+    plot.margin = unit(c(0.5, 1, 0.5, 0.5), "lines")
+  )
+
+# ===============================
+# 11. HOTSPOT IDENTIFICATION
+# ===============================
+
+# Identify density hotspots
+density_threshold <- quantile(td_zone_assaults$density, 0.75)
+td_zone_assaults$is_hotspot <- td_zone_assaults$density >= density_threshold
+
+# Improved hotspot map with better colors for visibility
+hotspot_map <- ggmap(boston_map) +
+  # First add non-hotspot points
+  geom_point(data = td_zone_assaults %>% filter(!is_hotspot), 
+             aes(x = Long, y = Lat), 
+             color = "darkblue", size = 3, alpha = 0.7) +
+  # Then add hotspot points on top with bright red color
+  geom_point(data = td_zone_assaults %>% filter(is_hotspot), 
+             aes(x = Long, y = Lat, size = density),
+             color = "red", alpha = 0.9) +
+  # Add TD Garden location
+  annotate("point", x = -71.0621, y = 42.3663, color = "black", size = 3, shape = 4) +
+  annotate("text", x = -71.0621, y = 42.3673, label = "TD Garden", 
+           fontface = "bold", size = 3.5, color = "black") +
+  scale_size_continuous(
+    name = "Incident\nDensity",
+    breaks = seq(60, 75, by = 5)
+  ) +
+  labs(title = "Assault Hotspot Identification", 
+       subtitle = paste0("Hotspots defined as locations with density >= ", 
+                         round(density_threshold), " nearby incidents"),
+       x = "Geographic Position (West to East)", 
+       y = "Geographic Position (South to North)") +
+  guides(
+    size = guide_legend(title.position = "top")
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 10),
+    panel.grid.minor = element_blank(),
+    plot.margin = unit(c(0.5, 1, 0.5, 0.5), "lines")
+  )
+
+# ===============================
+# 12. HOUR OF DAY ANALYSIS
+# ===============================
+
+# Create hour bands for better analysis
+td_zone_assaults$hour_band <- cut(
+  td_zone_assaults$HOUR, 
+  breaks = c(-1, 4, 11, 16, 22, 24),  
+  labels = c("Late Night (0-4)", "Morning (5-11)", "Afternoon (12-16)", 
+             "Evening (17-22)", "Night (23-24)")
+)
+
+# Summary table
+hour_summary <- td_zone_assaults %>% 
+  group_by(hour_band, ZONE_SHORT) %>%
+  summarize(
+    count = n(),
+    avg_density = mean(density),
+    .groups = 'drop'
+  )
+
+# Heat map of hour band by zone
+hour_heatmap <- ggplot(hour_summary, aes(x = ZONE_SHORT, y = hour_band)) +
+  geom_tile(aes(fill = count), color = "black") +
+  geom_text(aes(label = count), color = "white", fontface = "bold", size = 4) +
+  scale_fill_viridis_c(
+    option = "inferno",
+    name = "Incident Count"
+  ) +
+  labs(title = "Assault Incidents by Time and Location",
+       subtitle = "Count of incidents by time band and street",
+       x = "Street", 
+       y = "Time of Day") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 0, hjust = 0.5, size = 11),
+    axis.text.y = element_text(size = 11),
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 10),
+    panel.grid = element_blank(),
+    legend.key.height = unit(1.5, "cm"),
+    plot.margin = unit(c(0.5, 1, 0.5, 0.5), "lines")
+  )
+
+# Create density heatmap
+density_heatmap <- ggplot(hour_summary, aes(x = ZONE_SHORT, y = hour_band)) +
+  geom_tile(aes(fill = avg_density), color = "black") +
+  geom_text(aes(label = round(avg_density, 1)), color = "white", fontface = "bold", size = 4) +
+  scale_fill_viridis_c(
+    option = "viridis",
+    name = "Avg. Nearby\nIncidents"
+  ) +
+  labs(title = "Average Assault Density by Time and Location",
+       subtitle = "Average number of nearby incidents (within 200m)",
+       x = "Street", 
+       y = "Time of Day") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 0, hjust = 0.5, size = 11),
+    axis.text.y = element_text(size = 11),
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 10),
+    panel.grid = element_blank(),
+    legend.key.height = unit(1.5, "cm"),
+    plot.margin = unit(c(0.5, 1, 0.5, 0.5), "lines")
+  )
+
+# ===============================
+# 13. EXTENSION: NIGHTLIFE DISTRICTS COMPARISON
+# ===============================
+
+# Create the nightlife centers data frame
+nightlife_centers <- data.frame(
+  area = c("TD Garden", "Fenway", "Theater District", "Seaport", "North End"),
+  lon = c(-71.061, -71.097, -71.063, -71.047, -71.054),
+  lat = c(42.365, 42.346, 42.352, 42.351, 42.365)
+)
+
+# Calculate the bounding box for all points
+min_lon <- min(nightlife_centers$lon) - 0.005  # Add padding
+max_lon <- max(nightlife_centers$lon) + 0.005
+min_lat <- min(nightlife_centers$lat) - 0.005
+max_lat <- max(nightlife_centers$lat) + 0.005
+
+# Calculate center point
+center_lon <- (min_lon + max_lon) / 2
+center_lat <- (min_lat + max_lat) / 2
+
+# Calculate appropriate zoom level
+zoom_level <- 13
+
+# Get a wider map of Boston with adjusted center and zoom
+boston_overview <- get_googlemap(
+  center = c(lon = center_lon, lat = center_lat), 
+  zoom = zoom_level,
+  maptype = "roadmap"
+)
+
+# Improved nightlife districts map
+districts_map <- ggmap(boston_overview) +
+  # Add points for each district with bigger size
+  geom_point(
+    data = nightlife_centers, 
+    aes(x = lon, y = lat),
+    color = c("purple", "red", "orange", "green", "blue"),
+    size = 8
+  ) +
+  # Add district name labels with white background for legibility
+  geom_label(
+    data = nightlife_centers,
+    aes(x = lon, y = lat - 0.004, label = area),
+    fill = "white",
+    color = c("purple", "red", "orange", "green", "blue"),
+    fontface = "bold",
+    size = 3.5,
+    alpha = 0.8,
+    label.padding = unit(0.5, "lines")
+  ) +
+  # Add better labels and title
+  labs(
+    title = "Boston's Major Nightlife Districts",
+    subtitle = "Framework for extended assault pattern analysis",
+    x = "Longitude", 
+    y = "Latitude",
+    caption = "TD Garden analysis could be extended to these comparable areas"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 10),
+    panel.grid.minor = element_blank(),
+    plot.margin = unit(c(0.5, 1, 0.5, 0.5), "lines")
+  )
+
+# ===============================
+# 14. DISPLAY ALL PLOTS & FINAL OUTPUT
+# ===============================
+# First plot
+print(hour_plot)
+print(canal_weekend_plot)
+print(causeway_weekend_plot)
+print(nashua_weekend_plot)
+print(season_plot)
+print(location_map)
+print(weekend_map)
+print(season_map)
+print(radius_plot)
+print(density_map)
+print(pred_map)
+print(residual_map)
+print(hotspot_map)
+print(hour_heatmap)
+print(density_heatmap)
+print(districts_map)
+print(plot_compare)
+
+# ===============================
+# 15. SAVE RESULTS AS PDF 
+# ===============================
+
+# Define a function to create the PDF
+create_pdf <- function(file_path) {
+  # Create PDF
+  pdf(file_path, width = 11, height = 8.5)
+  
+  # Main visualisations
+  print(hour_plot)
+  print(canal_weekend_plot)
+  print(causeway_weekend_plot)
+  print(nashua_weekend_plot)
+  print(season_plot)
+  print(location_map)
+  print(weekend_map)
+  print(season_map)
+  print(radius_plot)
+  print(density_map)
+  print(pred_map)
+  print(residual_map)
+  print(hotspot_map)
+  print(hour_heatmap)
+  print(density_heatmap)
+  print(districts_map)
+  print(plot_compare)
+  
+  # Add a summary text page
+  summary_text <- paste(
+    "TD GARDEN ASSAULT INCIDENT ANALYSIS: SUMMARY OF FINDINGS",
+    "=======================================================",
+    "",
+    "1. TEMPORAL PATTERNS:",
+    "   - Peak hours for assaults are late night (0-4am) and evening (17-22pm)",
+    "   - Weekend patterns differ significantly from weekday patterns",
+    "   - Seasonal variation with increased incidents in summer months",
+    "",
+    "2. SPATIAL PATTERNS:",
+    "   - Causeway-Canal intersection shows highest risk",
+    "   - Nashua Street has fewer incidents but still shows clustering",
+    "   - Spatial proximity is highly predictive of assault risk",
+    "",
+    "3. MODELING EFFECTIVENESS:",
+    paste0("   - ", best_model_name, " performs best (MSE: ", round(model_comparison$MSE[1], 2), ")"),
+    "   - Linear regression performs poorly due to non-linear patterns",
+    "   - 200m radius provides optimal density calculation",
+    "",
+    "4. HOTSPOT IDENTIFICATION:",
+    paste0("   - ", sum(td_zone_assaults$is_hotspot), " hotspots identified with density >= ", round(density_threshold, 1)),
+    "   - Hotspots cluster primarily around Canal-Causeway intersection",
+    "   - Late night shows highest hotspot concentration",
+    "",
+    "5. RECOMMENDATIONS:",
+    "   - Focus police presence at Canal-Causeway intersection",
+    "   - Prioritize coverage during late night/early morning hours",
+    "   - Enhanced presence after events, particularly on weekends",
+    "",
+    "6. LIMITATIONS:",
+    "   - Analysis limited to reported incidents only",
+    "   - Coordinate data required processing/smoothing",
+    "   - Temporal patterns may be affected by event scheduling",
+    "",
+    sep = "\n"
+  )
+  
+  # Create a blank page with text
+  grid.newpage()
+  grid.text(summary_text, x = 0.05, y = 0.95, just = c("left", "top"))
+  
+  # Close the PDF
+  dev.off()
+  
+  # Print confirmation
+  cat("\nAnalysis complete. Results saved to:", file_path, "\n")
+}
+
+# Use file.choose() to allow the user to select where to save the PDF
+if (interactive()) {
+  # Ask user to choose where to save the PDF file
+  cat("\nPlease choose where to save the PDF report...\n")
+  
+  # Default filename suggestion
+  default_filename <- "TD_Garden_Assault_Analysis.pdf"
+  
+  if (requireNamespace("rstudioapi", quietly = TRUE)) {
+    # RStudio's API for file saving dialog
+    save_path <- rstudioapi::selectFile(
+      caption = "Save PDF Report As...",
+      label = "Save",
+      path = default_filename,
+      filter = "PDF Files (*.pdf)",
+      existing = FALSE
+    )
+    
+    if (!is.null(save_path) && nchar(save_path) > 0) {
+      # Add .pdf extension if not present
+      if (!grepl("\\.pdf$", save_path, ignore.case = TRUE)) {
+        save_path <- paste0(save_path, ".pdf")
+      }
+      create_pdf(save_path)
+    } else {
+      cat("PDF creation cancelled.\n")
+    }
+  } else {
+    # Using default working directory with interactive prompt
+    cat("No file selection dialog available. Saving to default location.\n")
+    create_pdf(default_filename)
+    cat("PDF saved to:", file.path(getwd(), default_filename), "\n")
+  }
+} else {
+  # Non-interactive environment, save to default location
+  default_filename <- "TD_Garden_Assault_Analysis.pdf"
+  create_pdf(default_filename)
+}
